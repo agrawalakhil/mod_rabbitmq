@@ -4,7 +4,7 @@
 %% @author Tony Garnock-Jones <tonyg@lshift.net>
 %% @author Rabbit Technologies Ltd. <info@rabbitmq.com>
 %% @author LShift Ltd. <query@lshift.net>
-%% @copyright 2008 Tony Garnock-Jones and Rabbit Technologies Ltd.; Copyright © 2008-2009 Tony Garnock-Jones and LShift Ltd.
+%% @copyright 2008 Tony Garnock-Jones and Rabbit Technologies Ltd.; Copyright 2008-2009 Tony Garnock-Jones and LShift Ltd.
 %% @license
 %%
 %% This program is free software; you can redistribute it and/or
@@ -22,7 +22,6 @@
 %% Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
 %% 02111-1307 USA
 %%---------------------------------------------------------------------------
-%%
 %% @doc RabbitMQ gateway module for ejabberd.
 %%
 %% All of the exposed functions of this module are private to the
@@ -35,14 +34,15 @@
 -behaviour(gen_server).
 -behaviour(gen_mod).
 
--export([start_link/2, start/2, stop/1]).
+-export([start_link/2, start/2, stop/1, mod_opt_type/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -export([route/3]).
 -export([consumer_init/5, consumer_main/1]).
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
--include("rabbit.hrl").
+-include("logger.hrl").
+-include_lib("amqp_client/include/amqp_client.hrl").
 
 -define(VHOST, <<"/">>).
 -define(XNAME(Name), #resource{virtual_host = ?VHOST, kind = exchange, name = Name}).
@@ -80,13 +80,17 @@ stop(Host) ->
     supervisor:terminate_child(ejabberd_sup, Proc),
     supervisor:delete_child(ejabberd_sup, Proc).
 
+mod_opt_type(rabbitmq_node) -> fun iolist_to_binary/1;
+mod_opt_type(_) ->    
+    [rabbitmq_node].
+
 %%---------------------------------------------------------------------------
 
 %% @hidden
 init([Host, Opts]) ->
     ok = contact_rabbitmq(),
 
-    MyHost = gen_mod:get_opt_host(Host, Opts, "rabbitmq.@HOST@"),
+    MyHost = gen_mod:get_opt_host(Host, Opts, <<"rabbitmq.@HOST@">>),
     ejabberd_router:register_route(MyHost, {apply, ?MODULE, route}),
 
     probe_queues(MyHost),
@@ -96,7 +100,7 @@ init([Host, Opts]) ->
 contact_rabbitmq() ->
     case get(rabbitmq_node) of
         undefined ->
-            RabbitNode = case gen_mod:get_module_opt(global, ?MODULE, rabbitmq_node, undefined) of
+            RabbitNode = case gen_mod:get_module_opt(global, ?MODULE, rabbitmq_node, fun(RN) -> list_to_atom(binary:bin_to_list(RN)) end) of
                              undefined ->
                                  [_NodeName, NodeHost] = string:tokens(atom_to_list(node()), "@"),
                                  list_to_atom("rabbit@" ++ NodeHost);
@@ -143,6 +147,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% @hidden
 route(From, To, Packet) ->
     ok = contact_rabbitmq(),
+    ?DEBUG("mod_rabbitmq:route - from:~p, to: ~p, packet: ~p~n", [From, To, Packet]),
     safe_route(shortcut, From, To, Packet).
 
 safe_route(ShortcutKind, From, To, Packet) ->
@@ -163,44 +168,45 @@ rabbit_call(M, F, A) ->
             V
     end.
 
+rabbit_queue_lookup(QN) ->
+    rabbit_call(rabbit_amqqueue, lookup, [QN]).
+
 rabbit_exchange_lookup(XN) ->
     rabbit_call(rabbit_exchange, lookup, [XN]).
 
 do_route(#jid{lserver = FromServer} = From,
 	 #jid{lserver = ToServer} = To,
-	 {xmlelement, "presence", _, _})
+	 {xmlel, <<"presence">>, _, _})
   when FromServer == ToServer ->
     %% Break tight loops by ignoring these presence packets.
     ?WARNING_MSG("Tight presence loop between~n~p and~n~p~nbroken.",
 		 [From, To]),
     ok;
-do_route(From, #jid{luser = ""} = To, {xmlelement, "presence", _, _} = Packet) ->
-    case xml:get_tag_attr_s("type", Packet) of
-	"subscribe" ->
+do_route(From, #jid{luser = <<"">>} = To, {xmlel, <<"presence">>, _, _} = Packet) ->
+    case xml:get_tag_attr_s(<<"type">>, Packet) of
+	<<"subscribe">> ->
 	    send_presence(To, From, "unsubscribed");
-	"subscribed" ->
+	<<"subscribed">> ->
 	    send_presence(To, From, "unsubscribe"),
 	    send_presence(To, From, "unsubscribed");
-	"unsubscribe" ->
+	<<"unsubscribe">> ->
 	    send_presence(To, From, "unsubscribed");
-
-	"probe" ->
+	<<"probe">> ->
 	    send_presence(To, From, "");
-
 	_Other ->
 	    ?INFO_MSG("Other kind of presence for empty-user JID~n~p", [Packet])
     end,
     ok;
-do_route(From, To, {xmlelement, "presence", _, _} = Packet) ->
+do_route(From, To, {xmlel, <<"presence">>, _, _} = Packet) ->
     QNameBin = jid_to_qname(From),
     {XNameBin, RKBin} = jid_to_xname(To),
-    case xml:get_tag_attr_s("type", Packet) of
-	"subscribe" ->
+    case xml:get_tag_attr_s(<<"type">>, Packet) of
+	<<"subscribe">> ->
 	    case rabbit_exchange_lookup(?XNAME(XNameBin)) of
 		{ok, _X} -> send_presence(To, From, "subscribe");
 		{error, not_found} -> send_presence(To, From, "unsubscribed")
 	    end;
-	"subscribed" ->
+	<<"subscribed">> ->
 	    case check_and_bind(XNameBin, RKBin, QNameBin) of
 		true ->
 		    send_presence(To, From, "subscribed"),
@@ -209,41 +215,38 @@ do_route(From, To, {xmlelement, "presence", _, _} = Packet) ->
 		    send_presence(To, From, "unsubscribed"),
 		    send_presence(To, From, "unsubscribe")
 	    end;
-	"unsubscribe" ->
+	<<"unsubscribe">> ->
 	    maybe_unsub(From, To, XNameBin, RKBin, QNameBin),
 	    send_presence(To, From, "unsubscribed");
-	"unsubscribed" ->
+	<<"unsubscribed">> ->
 	    maybe_unsub(From, To, XNameBin, RKBin, QNameBin);
-
-	"" ->
+	<<"">> ->
 	    start_consumer(QNameBin, From, RKBin, To#jid.lserver, extract_priority(Packet));
-	"unavailable" ->
+	<<"unavailable">> ->
 	    stop_consumer(QNameBin, From, RKBin, false);
-
-	"probe" ->
+	<<"probe">> ->
 	    case is_subscribed(XNameBin, RKBin, QNameBin) of
 		true ->
 		    send_presence(To, From, "");
 		false ->
 		    ok
 	    end;
-
 	_Other ->
 	    ?INFO_MSG("Other kind of presence~n~p", [Packet])
     end,
     ok;
-do_route(From, To, {xmlelement, "message", _, _} = Packet) ->
-    case xml:get_subtag_cdata(Packet, "body") of
-	"" ->
+do_route(From, To, {xmlel, <<"message">>, _, _} = Packet) ->
+    case xml:get_subtag_cdata(Packet, <<"body">>) of
+	<<"">> ->
 	    ?DEBUG("Ignoring message with empty body", []);
 	Body ->
 	    {XNameBin, RKBin} = jid_to_xname(To),
 	    case To#jid.luser of
-		"" ->
+		<<"">> ->
 		    send_command_reply(To, From, do_command(To, From, Body, parse_command(Body)));
 		_ ->
-		    case xml:get_tag_attr_s("type", Packet) of
-			"error" ->
+		    case xml:get_tag_attr_s(<<"type">>, Packet) of
+			<<"error">> ->
 			    ?ERROR_MSG("Received error message~n~p -> ~p~n~p", [From, To, Packet]);
 			_ ->
                             %% FIXME: So many roundtrips!!
@@ -251,7 +254,7 @@ do_route(From, To, {xmlelement, "message", _, _} = Packet) ->
                                               [?XNAME(XNameBin),
                                                RKBin,
                                                [{'content_type', <<"text/plain">>}],
-                                               list_to_binary(Body)]),
+                                               Body]),
                             Delivery = rabbit_call(rabbit_basic, delivery,
                                                    [false, false, none, Msg]),
                             rabbit_call(rabbit_basic, publish, [Delivery])
@@ -259,12 +262,12 @@ do_route(From, To, {xmlelement, "message", _, _} = Packet) ->
 	    end
     end,
     ok;
-do_route(From, To, {xmlelement, "iq", _, Els0} = Packet) ->
+do_route(From, To, {xmlel, <<"iq">>, _, Els0} = Packet) ->
     Els = xml:remove_cdata(Els0),
-    IqId = xml:get_tag_attr_s("id", Packet),
-    case xml:get_tag_attr_s("type", Packet) of
-	"get" -> reply_iq(To, From, IqId, do_iq(get, From, To, Els));
-	"set" -> reply_iq(To, From, IqId, do_iq(set, From, To, Els));
+    IqId = xml:get_tag_attr_s(<<"id">>, Packet),
+    case xml:get_tag_attr_s(<<"type">>, Packet) of
+	<<"get">> -> reply_iq(To, From, IqId, do_iq(get, From, To, Els));
+	<<"set">> -> reply_iq(To, From, IqId, do_iq(set, From, To, Els));
 	Other -> ?WARNING_MSG("Unsolicited IQ of type ~p~n~p ->~n~p~n~p",
 			      [Other, From, To, Packet])
     end,
@@ -282,29 +285,29 @@ reply_iq(From, To, IqId, {OkOrError, Els}) ->
 		      "error"
 	      end,
     Attrs = case IqId of
-		"" -> [{"type", TypeStr}];
-		_ -> [{"type", TypeStr}, {"id", IqId}]
+		<<"">> -> [{<<"type">>, list_to_binary(TypeStr)}];
+		_ -> [{<<"type">>, list_to_binary(TypeStr)}, {<<"id">>, list_to_binary(IqId)}]
 	    end,
-    ejabberd_router:route(From, To, {xmlelement, "iq", Attrs, Els}).
+    ejabberd_router:route(From, To, {xmlel, <<"iq">>, Attrs, Els}).
 
 do_iq(_GetOrSet, _From, _To, []) ->
     {error, iq_error("modify", "bad-request", "Missing IQ element")};
 do_iq(_GetOrSet, _From, _To, [_, _ | _]) ->
     {error, iq_error("modify", "bad-request", "Too many IQ elements")};
 do_iq(GetOrSet, From, To, [Elt]) ->
-    Xmlns = xml:get_tag_attr_s("xmlns", Elt),
+    Xmlns = xml:get_tag_attr_s(<<"xmlns">>, Elt),
     do_iq1(GetOrSet, From, To, Xmlns, Elt).
 
 
-do_iq1(get, _From, To, "http://jabber.org/protocol/disco#info",
-       {xmlelement, "query", _, _}) ->
+do_iq1(get, _From, To, <<"http://jabber.org/protocol/disco#info">>,
+       {xmlel, <<"query">>, _, _}) ->
     {XNameBin, RKBin} = jid_to_xname(To),
     case XNameBin of
 	<<>> -> disco_info_module(To#jid.lserver);
 	_ -> disco_info_exchange(XNameBin, RKBin)
     end;
-do_iq1(get, _From, To, "http://jabber.org/protocol/disco#items",
-       {xmlelement, "query", _, _}) ->
+do_iq1(get, _From, To, <<"http://jabber.org/protocol/disco#items">>,
+       {xmlel, <<"query">>, _, _}) ->
     {XNameBin, RKBin} = jid_to_xname(To),
     case XNameBin of
 	<<>> -> disco_items_module(To#jid.lserver);
@@ -337,7 +340,7 @@ disco_info_exchange(XNameBin, _RKBin) ->
 			    | Tail])}.
 
 disco_items_module(Server) ->
-    {ok, disco_items_result([jlib:make_jid(XNameStr, Server, "")
+    {ok, disco_items_result([jlib:make_jid(list_to_binary(XNameStr), Server, <<"">>)
 			     || XNameStr <- all_exchange_names()])}.
 
 disco_items_exchange(_XNameStr, _RKBin) ->
@@ -347,51 +350,51 @@ disco_info_result(Pieces) ->
     disco_info_result(Pieces, []).
 
 disco_info_result([], ConvertedPieces) ->
-    [{xmlelement, "query", [{"xmlns", "http://jabber.org/protocol/disco#info"}], ConvertedPieces}];
+    [{xmlel, "query", [{"xmlns", "http://jabber.org/protocol/disco#info"}], ConvertedPieces}];
 disco_info_result([{Category, Type, Name} | Rest], ConvertedPieces) ->
-    disco_info_result(Rest, [{xmlelement, "identity", [{"category", Category},
+    disco_info_result(Rest, [{xmlel, "identity", [{"category", Category},
 							      {"type", Type},
 							      {"name", Name}], []}
 				    | ConvertedPieces]);
 disco_info_result([Feature | Rest], ConvertedPieces) ->
-    disco_info_result(Rest, [{xmlelement, "feature", [{"var", Feature}], []}
+    disco_info_result(Rest, [{xmlel, "feature", [{"var", Feature}], []}
 				    | ConvertedPieces]).
 
 disco_items_result(Pieces) ->
-    [{xmlelement, "query", [{"xmlns", "http://jabber.org/protocol/disco#items"}],
-      [{xmlelement, "item", [{"jid", jlib:jid_to_string(Jid)}], []} || Jid <- Pieces]}].
+    [{xmlel, "query", [{"xmlns", "http://jabber.org/protocol/disco#items"}],
+      [{xmlel, "item", [{"jid", jlib:jid_to_string(Jid)}], []} || Jid <- Pieces]}].
 
 iq_error(TypeStr, ConditionStr, MessageStr) ->
     iq_error(TypeStr, ConditionStr, MessageStr, []).
 
 iq_error(TypeStr, ConditionStr, MessageStr, ExtraElements) ->
-    [{xmlelement, "error", [{"type", TypeStr}],
-      [{xmlelement, ConditionStr, [], []},
-       {xmlelement, "text", [{"xmlns", "urn:ietf:params:xml:ns:xmpp-stanzas"}],
-	[{xmlcdata, MessageStr}]}
+    [{xmlel, <<"error">>, [{<<"type">>, list_to_binary(TypeStr)}],
+      [{xmlel, ConditionStr, [], []},
+       {xmlel, <<"text">>, [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-stanzas">>}],
+	[{xmlcdata, list_to_binary(MessageStr)}]}
        | ExtraElements]}].
 
 extract_priority(Packet) ->
-    case xml:get_subtag_cdata(Packet, "priority") of
-	"" ->
+    case xml:get_subtag_cdata(Packet, <<"priority">>) of
+	<<"">> ->
 	    0;
 	S ->
-	    list_to_integer(S)
+	    list_to_integer(binary_to_list(S))
     end.
 
 jid_to_qname(#jid{luser = U, lserver = S}) ->
-    list_to_binary(U ++ "@" ++ S).
+    list_to_binary(binary_to_list(U) ++ "@" ++ binary_to_list(S)).
 
 jid_to_xname(#jid{luser = U, lresource = R}) ->
-    {list_to_binary(U), list_to_binary(R)}.
+    {U, R}.
 
 qname_to_jid(QNameBin) when is_binary(QNameBin) ->
-    case jlib:string_to_jid(binary_to_list(QNameBin)) of
+    case jlib:string_to_jid(QNameBin) of
 	error ->
 	    error;
 	JID ->
 	    case JID#jid.luser of
-		"" ->
+		<<"">> ->
 		    error;
 		_ ->
 		    JID
@@ -421,8 +424,8 @@ do_unsub(QJID, XJID, XNameBin, RKBin, QNameBin) ->
 get_bound_queues(XNameBin) ->
     XName = ?XNAME(XNameBin),
     [{QNameBin, RKBin} ||
-	#binding{queue_name = #resource{name = QNameBin}, key = RKBin} <-
-            rabbit_call(rabbit_binding, list_for_exchange, [XName])].
+	#binding{destination = #resource{name = QNameBin, kind = queue}, key = RKBin} <-
+            rabbit_call(rabbit_binding, list_for_source, [XName])].
 
 unsub_all(XNameBin, ExchangeJID) ->
     {atomic, BindingDescriptions} =
@@ -450,27 +453,27 @@ unsub_all(XNameBin, ExchangeJID) ->
 
 send_presence(From, To, "") ->
     ?DEBUG("Sending sub reply of type ((available))~n~p -> ~p", [From, To]),
-    ejabberd_router:route(From, To, {xmlelement, "presence", [], []});
+    ejabberd_router:route(From, To, {xmlel, <<"presence">>, [], []});
 send_presence(From, To, TypeStr) ->
     ?DEBUG("Sending sub reply of type ~p~n~p -> ~p", [TypeStr, From, To]),
-    ejabberd_router:route(From, To, {xmlelement, "presence", [{"type", TypeStr}], []}).
+    ejabberd_router:route(From, To, {xmlel, <<"presence">>, [{<<"type">>, list_to_binary(TypeStr)}], []}).
 
 send_message(From, To, TypeStr, BodyStr) ->
-    XmlBody = {xmlelement, "message",
-	       [{"type", TypeStr},
-		{"from", jlib:jid_to_string(From)},
-		{"to", jlib:jid_to_string(To)}],
-	       [{xmlelement, "body", [],
-		 [{xmlcdata, BodyStr}]}]},
+    XmlBody = {xmlel, <<"message">>,
+	       [{<<"type">>, list_to_binary(TypeStr)},
+		{<<"from">>, From},
+		{<<"to">>, To}],
+	       [{xmlel, <<"body">>, [],
+		 [{xmlcdata, list_to_binary(BodyStr)}]}]},
     ?DEBUG("Delivering ~p -> ~p~n~p", [From, To, XmlBody]),
     ejabberd_router:route(From, To, XmlBody).
 
 rabbit_exchange_list_queue_bindings(QN) ->
-    rabbit_call(rabbit_binding, list_for_queue, [QN]).
+    rabbit_call(rabbit_binding, list_for_destination, [QN]).
 
 is_subscribed(XNameBin, RKBin, QNameBin) ->
     XName = ?XNAME(XNameBin),
-    lists:any(fun (#binding{exchange_name = N, key = R})
+    lists:any(fun (#binding{source = N, key = R})
                     when N == XName andalso R == RKBin ->
 		      true;
 		  (_) ->
@@ -482,11 +485,15 @@ check_and_bind(XNameBin, RKBin, QNameBin) ->
     case rabbit_exchange_lookup(?XNAME(XNameBin)) of
 	{ok, _X} ->
 	    ?DEBUG("... exists", []),
-	    #amqqueue{} = rabbit_call(rabbit_amqqueue, declare,
-                                      [?QNAME(QNameBin), true, false, [], none]),
+	    case rabbit_queue_lookup(?QNAME(QNameBin)) of
+		{error, not_found} ->
+		    #amqqueue{} = rabbit_call(rabbit_amqqueue, declare,
+					      [?QNAME(QNameBin), true, false, [], none]);
+		_ -> ok
+	    end,
 	    ok = rabbit_call(rabbit_binding, add,
-                             [#binding{exchange_name = ?XNAME(XNameBin),
-                                       queue_name    = ?QNAME(QNameBin),
+                             [#binding{source = ?XNAME(XNameBin),
+                                       destination    = ?QNAME(QNameBin),
                                        key           = RKBin,
                                        args          = []}]),
 	    true;
@@ -500,8 +507,8 @@ unbind_and_delete(XNameBin, RKBin, QNameBin) ->
     XName = ?XNAME(XNameBin),
     QName = ?QNAME(QNameBin),
     case rabbit_call(rabbit_binding, remove,
-                     [#binding{exchange_name = XName,
-                               queue_name    = QName,
+                     [#binding{source = XName,
+                               destination    = QName,
                                key           = RKBin,
                                args          = []}]) of
 	{error, _Reason} ->
@@ -565,9 +572,9 @@ probe_queues(Server, [#amqqueue{name = QName = #resource{name = QNameBin}} | Res
 probe_bindings(_Server, _JID, []) ->
     ok;
 probe_bindings(Server, JID,
-               [#binding{exchange_name = #resource{name = XNameBin}} | Rest]) ->
-    ?DEBUG("**** Probing ~p ~p ~p", [JID, XNameBin, Server]),
-    SourceJID = jlib:make_jid(binary_to_list(XNameBin), Server, ""),
+               [#binding{source = #resource{name = XNameBin}} | Rest]) ->
+    SourceJID = jlib:make_jid(XNameBin, Server, <<"">>),
+    ?DEBUG("**** Probing ~p ~p ~p, source: ~p~n", [JID, XNameBin, Server, SourceJID]),
     send_presence(SourceJID, JID, "probe"),
     send_presence(SourceJID, JID, ""),
     probe_bindings(Server, JID, Rest).
@@ -668,12 +675,12 @@ consumer_main(#consumer_state{priorities = Priorities} = State) ->
 	    ?MODULE:consumer_main(State#consumer_state{priorities = NewPriorities});
 	{'$gen_cast', {deliver, _ConsumerTag, false, {_QName, QPid, _Id, _Redelivered, Msg}}} ->
 	    #basic_message{exchange_name = #resource{name = XNameBin},
-			   routing_key = RKBin,
+			   routing_keys = [RKBin],
 			   content = #content{payload_fragments_rev = PayloadRev}} = Msg,
 	    [{_, {TopPriorityJID, _}} | _] = Priorities,
-	    send_message(jlib:make_jid(binary_to_list(XNameBin),
+	    send_message(jlib:make_jid(XNameBin,
 				       State#consumer_state.lserver,
-				       binary_to_list(RKBin)),
+				       RKBin),
 			 TopPriorityJID,
 			 "chat",
 			 binary_to_list(list_to_binary(lists:reverse(PayloadRev)))),
@@ -735,7 +742,7 @@ do_command(#jid{lserver = Server} = _To, _From, _RawCommand, {"exchange.delete",
 	    {ok, "You are not allowed to delete names starting with 'amq.'."};
 	_ ->
 	    XNameBin = list_to_binary(NameStr),
-	    unsub_all(XNameBin, jlib:make_jid(NameStr, Server, "")),
+	    unsub_all(XNameBin, jlib:make_jid(list_to_binary(NameStr), Server, <<"">>)),
 	    %%rabbit_exchange:delete(?XNAME(XNameBin), false),
 	    {ok, "Exchange ~p deleted.", [NameStr]}
     end;
@@ -817,15 +824,15 @@ check_ichat_brokenness(JIDStr, RK, RKs) ->
     end.
 
 do_command_bind(Server, NameStr, JIDStr, RK) ->
-    XJID = jlib:make_jid(NameStr, Server, RK),
-    QJID = jlib:string_to_jid(JIDStr),
+    XJID = jlib:make_jid(list_to_binary(NameStr), Server, list_to_binary(RK)),
+    QJID = jlib:string_to_jid(iolist_to_binary(JIDStr)),
     send_presence(XJID, QJID, "subscribe"),
     {ok, "Subscription process ~p <--> ~p initiated. Good luck!",
      [jlib:jid_to_string(XJID), jlib:jid_to_string(QJID)]}.
 
 do_command_unbind(Server, NameStr, JIDStr, RK) ->
-    XJID = jlib:make_jid(NameStr, Server, RK),
-    QJID = jlib:string_to_jid(JIDStr),
+    XJID = jlib:make_jid(list_to_binary(NameStr), Server, list_to_binary(RK)),
+    QJID = jlib:string_to_jid(iolist_to_binary(JIDStr)),
     do_unsub(QJID, XJID, list_to_binary(NameStr), list_to_binary(RK), list_to_binary(JIDStr)),
     {ok, "Unsubscription process ~p <--> ~p initiated. Good luck!",
      [jlib:jid_to_string(XJID), jlib:jid_to_string(QJID)]}.

@@ -1,0 +1,5 @@
+author: ""
+category: "data"
+summary: "Rabbitmq gateway for ejabberd"
+home: "https://github.com/agrawalakhil/mod_rabbitmq"
+url: "git@github.com:agrawalakhil/mod_rabbitmq.git"
